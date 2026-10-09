@@ -1,0 +1,15 @@
+{
+  "release": "v0.1.0",
+  "powerSyncWeb": "1.39.1",
+  "waSqlite": "1.7.2",
+  "sqlite": "3.53.0",
+  "emscripten": "4.0.9",
+  "sourceRevision": "d33fcd38a5b5a5e5539c4a3398346d030d4d3ed0",
+  "baseUrl": "https://github.com/akpor-kofi/sqlite-decimal-rn/releases/download/v0.1.0",
+  "files": {
+    "wa-sqlite.mjs": "2c2648c499358826aa765ff75acf026739b70cf829b35d9c71a0ecc1cb84fc9b",
+    "wa-sqlite.wasm": "fa15c4b71fecee54466f71ebbaebae57412b213252d2b3756356580cb9cf2f78",
+    "wa-sqlite-async.mjs": "b9bde8e27cd00d08163a2ffdb648792de9ecfd011fe3ab5054f98c220edc8ea6",
+    "wa-sqlite-async.wasm": "b47cfdad0a302b4dbe29e3905e74d58f58fe1161e0f3e6b9e12f95dd1839ae80"
+  }
+}

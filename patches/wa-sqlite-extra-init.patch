@@ -1,0 +1,22 @@
+diff --git a/src/main.c b/src/main.c
+index f479fc9..ef7b344 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -11,7 +11,14 @@ void* EMSCRIPTEN_KEEPALIVE getSqliteFree() {
+   return sqlite3_free;
+ }
+ 
++#ifdef SQLITE_WASM_EXTRA_INIT
++int SQLITE_WASM_EXTRA_INIT(void);
++#endif
++
+ int main() {
+-  sqlite3_initialize();
+-  return 0;
++  int rc = sqlite3_initialize();
++#ifdef SQLITE_WASM_EXTRA_INIT
++  if (rc == SQLITE_OK) rc = SQLITE_WASM_EXTRA_INIT();
++#endif
++  return rc;
+ }
+\ No newline at end of file

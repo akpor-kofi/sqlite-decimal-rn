@@ -1,0 +1,1670 @@
+diff --git a/android/CMakeLists.txt b/android/CMakeLists.txt
+index 66fd7c4dec4141a0a0c0b5c174bc5482342c0a7f..271db64101a559e5bfe316f99039ed4b563a2955 100644
+--- a/android/CMakeLists.txt
++++ b/android/CMakeLists.txt
+@@ -25,6 +25,7 @@ add_library(
+   ${PACKAGE_NAME}
+   SHARED
+   ../cpp/OPSqlite.cpp
++  ../cpp/decimal.c
+   ../cpp/utils.cpp
+   ../cpp/OPThreadPool.cpp
+   ../cpp/SmartHostObject.cpp
+diff --git a/cpp/bridge.cpp b/cpp/bridge.cpp
+index f298505fa6d3093fb91c8a5ae8d793dfc09cfa1d..d843c58a7c3627d59cb6ee5d66e52785c28837a2 100644
+--- a/cpp/bridge.cpp
++++ b/cpp/bridge.cpp
+@@ -21,6 +21,10 @@
+ #define TOKENIZER_LIST
+ #endif
+ 
++#ifdef OP_SQLITE_ENABLE_DECIMAL
++extern "C" int sqlite3_decimal_init(sqlite3 *, char **, const sqlite3_api_routines *);
++#endif
++
+ namespace opsqlite {
+ 
+ inline void opsqlite_bind_statement(sqlite3_stmt *statement,
+@@ -101,6 +105,16 @@ sqlite3 *opsqlite_open(std::string const &name, std::string const &path,
+     throw std::runtime_error(sqlite3_errmsg(db));
+   }
+ 
++#ifdef OP_SQLITE_ENABLE_DECIMAL
++  // Register on each connection; do not replace SQLCipher's SQLITE_EXTRA_INIT.
++  status = sqlite3_decimal_init(db, nullptr, nullptr);
++  if (status != SQLITE_OK) {
++    std::string message = sqlite3_errmsg(db);
++    sqlite3_close(db);
++    throw std::runtime_error(message);
++  }
++#endif
++
+ #ifdef OP_SQLITE_USE_SQLCIPHER
+   if (!encryption_key.empty()) {
+     opsqlite_execute(db, "PRAGMA key = '" + encryption_key + "'", nullptr);
+diff --git a/cpp/decimal.c b/cpp/decimal.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..5b0d2db61630a6210011951972b2680d2189b32f
+--- /dev/null
++++ b/cpp/decimal.c
+@@ -0,0 +1,891 @@
++#ifdef OP_SQLITE_ENABLE_DECIMAL
++#define SQLITE_CORE 1
++/*
++** 2020-06-22
++**
++** The author disclaims copyright to this source code.  In place of
++** a legal notice, here is a blessing:
++**
++**    May you do good and not evil.
++**    May you find forgiveness for yourself and forgive others.
++**    May you share freely, never taking more than you give.
++**
++******************************************************************************
++**
++** Routines to implement arbitrary-precision decimal math.
++**
++** The focus here is on simplicity and correctness, not performance.
++*/
++#include "sqlite3ext.h"
++SQLITE_EXTENSION_INIT1
++#include <assert.h>
++#include <string.h>
++#include <ctype.h>
++#include <stdlib.h>
++
++/* Mark a function parameter as unused, to suppress nuisance compiler
++** warnings. */
++#ifndef UNUSED_PARAMETER
++# define UNUSED_PARAMETER(X)  (void)(X)
++#endif
++
++#ifndef IsSpace
++#define IsSpace(X)  isspace((unsigned char)X)
++#endif
++
++/* A decimal object */
++typedef struct Decimal Decimal;
++struct Decimal {
++  char sign;        /* 0 for positive, 1 for negative */
++  char oom;         /* True if an OOM is encountered */
++  char isNull;      /* True if holds a NULL rather than a number */
++  char isInit;      /* True upon initialization */
++  int nDigit;       /* Total number of digits */
++  int nFrac;        /* Number of digits to the right of the decimal point */
++  signed char *a;   /* Array of digits.  Most significant first. */
++};
++
++/*
++** Release memory held by a Decimal, but do not free the object itself.
++*/
++static void decimal_clear(Decimal *p){
++  sqlite3_free(p->a);
++}
++
++/*
++** Destroy a Decimal object
++*/
++static void decimal_free(Decimal *p){
++  if( p ){
++    decimal_clear(p);
++    sqlite3_free(p);
++  }
++}
++
++/*
++** Allocate a new Decimal object initialized to the text in zIn[].
++** Return NULL if any kind of error occurs.
++*/
++static Decimal *decimalNewFromText(const char *zIn, int n){
++  Decimal *p = 0;
++  int i;
++  int iExp = 0;
++
++  p = sqlite3_malloc( sizeof(*p) );
++  if( p==0 ) goto new_from_text_failed;
++  p->sign = 0;
++  p->oom = 0;
++  p->isInit = 1;
++  p->isNull = 0;
++  p->nDigit = 0;
++  p->nFrac = 0;
++  p->a = sqlite3_malloc64( n+1 );
++  if( p->a==0 ) goto new_from_text_failed;
++  for(i=0; IsSpace(zIn[i]); i++){}
++  if( zIn[i]=='-' ){
++    p->sign = 1;
++    i++;
++  }else if( zIn[i]=='+' ){
++    i++;
++  }
++  while( i<n && zIn[i]=='0' ) i++;
++  while( i<n ){
++    char c = zIn[i];
++    if( c>='0' && c<='9' ){
++      p->a[p->nDigit++] = c - '0';
++    }else if( c=='.' ){
++      p->nFrac = p->nDigit + 1;
++    }else if( c=='e' || c=='E' ){
++      int j = i+1;
++      int neg = 0;
++      if( j>=n ) break;
++      if( zIn[j]=='-' ){
++        neg = 1;
++        j++;
++      }else if( zIn[j]=='+' ){
++        j++;
++      }
++      while( j<n && iExp<1000000 ){
++        if( zIn[j]>='0' && zIn[j]<='9' ){
++          iExp = iExp*10 + zIn[j] - '0';
++        }
++        j++;
++      }
++      if( neg ) iExp = -iExp;
++      break;
++    }
++    i++;
++  }
++  if( p->nFrac ){
++    p->nFrac = p->nDigit - (p->nFrac - 1);
++  }
++  if( iExp>0 ){
++    if( p->nFrac>0 ){
++      if( iExp<=p->nFrac ){
++        p->nFrac -= iExp;
++        iExp = 0;
++      }else{
++        iExp -= p->nFrac;
++        p->nFrac = 0;
++      }
++    }
++    if( iExp>0 ){   
++      p->a = sqlite3_realloc64(p->a, p->nDigit + iExp + 1 );
++      if( p->a==0 ) goto new_from_text_failed;
++      memset(p->a+p->nDigit, 0, iExp);
++      p->nDigit += iExp;
++    }
++  }else if( iExp<0 ){
++    int nExtra;
++    iExp = -iExp;
++    nExtra = p->nDigit - p->nFrac - 1;
++    if( nExtra ){
++      if( nExtra>=iExp ){
++        p->nFrac += iExp;
++        iExp  = 0;
++      }else{
++        iExp -= nExtra;
++        p->nFrac = p->nDigit - 1;
++      }
++    }
++    if( iExp>0 ){
++      p->a = sqlite3_realloc64(p->a, p->nDigit + iExp + 1 );
++      if( p->a==0 ) goto new_from_text_failed;
++      memmove(p->a+iExp, p->a, p->nDigit);
++      memset(p->a, 0, iExp);
++      p->nDigit += iExp;
++      p->nFrac += iExp;
++    }
++  }
++  return p;
++
++new_from_text_failed:
++  if( p ){
++    if( p->a ) sqlite3_free(p->a);
++    sqlite3_free(p);
++  }
++  return 0;
++}
++
++/* Forward reference */
++static Decimal *decimalFromDouble(double);
++
++/*
++** Allocate a new Decimal object from an sqlite3_value.  Return a pointer
++** to the new object, or NULL if there is an error.  If the pCtx argument
++** is not NULL, then errors are reported on it as well.
++**
++** If the pIn argument is SQLITE_TEXT or SQLITE_INTEGER, it is converted
++** directly into a Decimal.  For SQLITE_FLOAT or for SQLITE_BLOB of length
++** 8 bytes, the resulting double value is expanded into its decimal equivalent.
++** If pIn is NULL or if it is a BLOB that is not exactly 8 bytes in length,
++** then NULL is returned.
++*/
++static Decimal *decimal_new(
++  sqlite3_context *pCtx,       /* Report error here, if not null */
++  sqlite3_value *pIn,          /* Construct the decimal object from this */
++  int bTextOnly                /* Always interpret pIn as text if true */
++){
++  Decimal *p = 0;
++  int eType = sqlite3_value_type(pIn);
++  if( bTextOnly && (eType==SQLITE_FLOAT || eType==SQLITE_BLOB) ){
++    eType = SQLITE_TEXT;
++  }
++  switch( eType ){
++    case SQLITE_TEXT:
++    case SQLITE_INTEGER: {
++      const char *zIn = (const char*)sqlite3_value_text(pIn);
++      int n = sqlite3_value_bytes(pIn);
++      p = decimalNewFromText(zIn, n);
++      if( p==0 ) goto new_failed;
++      break;
++    }
++
++    case SQLITE_FLOAT: {
++      p = decimalFromDouble(sqlite3_value_double(pIn));
++      break;
++    }
++
++    case SQLITE_BLOB: {
++      const unsigned char *x;
++      unsigned int i;
++      sqlite3_uint64 v = 0;
++      double r;
++
++      if( sqlite3_value_bytes(pIn)!=sizeof(r) ) break;
++      x = sqlite3_value_blob(pIn);
++      for(i=0; i<sizeof(r); i++){
++        v = (v<<8) | x[i];
++      }
++      memcpy(&r, &v, sizeof(r));
++      p = decimalFromDouble(r);
++      break;
++    }
++
++    case SQLITE_NULL: {
++      break;
++    }
++  }
++  return p;
++
++new_failed:
++  if( pCtx ) sqlite3_result_error_nomem(pCtx);
++  sqlite3_free(p);
++  return 0;
++}
++
++/*
++** Make the given Decimal the result.
++*/
++static void decimal_result(sqlite3_context *pCtx, Decimal *p){
++  char *z;
++  int i, j;
++  int n;
++  if( p==0 || p->oom ){
++    sqlite3_result_error_nomem(pCtx);
++    return;
++  }
++  if( p->isNull ){
++    sqlite3_result_null(pCtx);
++    return;
++  }
++  z = sqlite3_malloc( p->nDigit+4 );
++  if( z==0 ){
++    sqlite3_result_error_nomem(pCtx);
++    return;
++  }
++  i = 0;
++  if( p->nDigit==0 || (p->nDigit==1 && p->a[0]==0) ){
++    p->sign = 0;
++  }
++  if( p->sign ){
++    z[0] = '-';
++    i = 1;
++  }
++  n = p->nDigit - p->nFrac;
++  if( n<=0 ){
++    z[i++] = '0';
++  }
++  j = 0;
++  while( n>1 && p->a[j]==0 ){
++    j++;
++    n--;
++  }
++  while( n>0  ){
++    z[i++] = p->a[j] + '0';
++    j++;
++    n--;
++  }
++  if( p->nFrac ){
++    z[i++] = '.';
++    do{
++      z[i++] = p->a[j] + '0';
++      j++;
++    }while( j<p->nDigit );
++  }
++  z[i] = 0;
++  sqlite3_result_text(pCtx, z, i, sqlite3_free);
++}
++
++/*
++** Make the given Decimal the result in an format similar to  '%+#e'.
++** In other words, show exponential notation with leading and trailing
++** zeros omitted.
++*/
++static void decimal_result_sci(sqlite3_context *pCtx, Decimal *p){
++  char *z;       /* The output buffer */
++  int i;         /* Loop counter */
++  int nZero;     /* Number of leading zeros */
++  int nDigit;    /* Number of digits not counting trailing zeros */
++  int nFrac;     /* Digits to the right of the decimal point */
++  int exp;       /* Exponent value */
++  signed char zero;     /* Zero value */
++  signed char *a;       /* Array of digits */
++
++  if( p==0 || p->oom ){
++    sqlite3_result_error_nomem(pCtx);
++    return;
++  }
++  if( p->isNull ){
++    sqlite3_result_null(pCtx);
++    return;
++  }
++  for(nDigit=p->nDigit; nDigit>0 && p->a[nDigit-1]==0; nDigit--){}
++  for(nZero=0; nZero<nDigit && p->a[nZero]==0; nZero++){}
++  nFrac = p->nFrac + (nDigit - p->nDigit);
++  nDigit -= nZero;
++  z = sqlite3_malloc( nDigit+20 );
++  if( z==0 ){
++    sqlite3_result_error_nomem(pCtx);
++    return;
++  }
++  if( nDigit==0 ){
++    zero = 0;
++    a = &zero;
++    nDigit = 1;
++    nFrac = 0;
++  }else{
++    a = &p->a[nZero];
++  }
++  if( p->sign && nDigit>0 ){
++    z[0] = '-';
++  }else{
++    z[0] = '+';
++  }
++  z[1] = a[0]+'0';
++  z[2] = '.';
++  if( nDigit==1 ){
++    z[3] = '0';
++    i = 4;
++  }else{
++    for(i=1; i<nDigit; i++){
++      z[2+i] = a[i]+'0';
++    }
++    i = nDigit+2;
++  }
++  exp = nDigit - nFrac - 1;
++  sqlite3_snprintf(nDigit+20-i, &z[i], "e%+03d", exp);
++  sqlite3_result_text(pCtx, z, -1, sqlite3_free);
++}
++
++/*
++** Compare to Decimal objects.  Return negative, 0, or positive if the
++** first object is less than, equal to, or greater than the second.
++**
++** Preconditions for this routine:
++**
++**    pA!=0
++**    pA->isNull==0
++**    pB!=0
++**    pB->isNull==0
++*/
++static int decimal_cmp(const Decimal *pA, const Decimal *pB){
++  int nASig, nBSig, rc, n;
++  if( pA->sign!=pB->sign ){
++    return pA->sign ? -1 : +1;
++  }
++  if( pA->sign ){
++    const Decimal *pTemp = pA;
++    pA = pB;
++    pB = pTemp;
++  }
++  nASig = pA->nDigit - pA->nFrac;
++  nBSig = pB->nDigit - pB->nFrac;
++  if( nASig!=nBSig ){
++    return nASig - nBSig;
++  }
++  n = pA->nDigit;
++  if( n>pB->nDigit ) n = pB->nDigit;
++  rc = memcmp(pA->a, pB->a, n);
++  if( rc==0 ){
++    rc = pA->nDigit - pB->nDigit;
++  }
++  return rc;
++}
++
++/*
++** SQL Function:   decimal_cmp(X, Y)
++**
++** Return negative, zero, or positive if X is less then, equal to, or
++** greater than Y.
++*/
++static void decimalCmpFunc(
++  sqlite3_context *context,
++  int argc,
++  sqlite3_value **argv
++){
++  Decimal *pA = 0, *pB = 0;
++  int rc;
++
++  UNUSED_PARAMETER(argc);
++  pA = decimal_new(context, argv[0], 1);
++  if( pA==0 || pA->isNull ) goto cmp_done;
++  pB = decimal_new(context, argv[1], 1);
++  if( pB==0 || pB->isNull ) goto cmp_done;
++  rc = decimal_cmp(pA, pB);
++  if( rc<0 ) rc = -1;
++  else if( rc>0 ) rc = +1;
++  sqlite3_result_int(context, rc);
++cmp_done:
++  decimal_free(pA);
++  decimal_free(pB);
++}
++
++/*
++** Expand the Decimal so that it has a least nDigit digits and nFrac
++** digits to the right of the decimal point.
++*/
++static void decimal_expand(Decimal *p, int nDigit, int nFrac){
++  int nAddSig;
++  int nAddFrac;
++  if( p==0 ) return;
++  nAddFrac = nFrac - p->nFrac;
++  nAddSig = (nDigit - p->nDigit) - nAddFrac;
++  if( nAddFrac==0 && nAddSig==0 ) return;
++  p->a = sqlite3_realloc64(p->a, nDigit+1);
++  if( p->a==0 ){
++    p->oom = 1;
++    return;
++  }
++  if( nAddSig ){
++    memmove(p->a+nAddSig, p->a, p->nDigit);
++    memset(p->a, 0, nAddSig);
++    p->nDigit += nAddSig;
++  }
++  if( nAddFrac ){
++    memset(p->a+p->nDigit, 0, nAddFrac);
++    p->nDigit += nAddFrac;
++    p->nFrac += nAddFrac;
++  }
++}
++
++/*
++** Add the value pB into pA.   A := A + B.
++**
++** Both pA and pB might become denormalized by this routine.
++*/
++static void decimal_add(Decimal *pA, Decimal *pB){
++  int nSig, nFrac, nDigit;
++  int i, rc;
++  if( pA==0 ){
++    return;
++  }
++  if( pA->oom || pB==0 || pB->oom ){
++    pA->oom = 1;
++    return;
++  }
++  if( pA->isNull || pB->isNull ){
++    pA->isNull = 1;
++    return;
++  }
++  nSig = pA->nDigit - pA->nFrac;
++  if( nSig && pA->a[0]==0 ) nSig--;
++  if( nSig<pB->nDigit-pB->nFrac ){
++    nSig = pB->nDigit - pB->nFrac;
++  }
++  nFrac = pA->nFrac;
++  if( nFrac<pB->nFrac ) nFrac = pB->nFrac;
++  nDigit = nSig + nFrac + 1;
++  decimal_expand(pA, nDigit, nFrac);
++  decimal_expand(pB, nDigit, nFrac);
++  if( pA->oom || pB->oom ){
++    pA->oom = 1;
++  }else{
++    if( pA->sign==pB->sign ){
++      int carry = 0;
++      for(i=nDigit-1; i>=0; i--){
++        int x = pA->a[i] + pB->a[i] + carry;
++        if( x>=10 ){
++          carry = 1;
++          pA->a[i] = x - 10;
++        }else{
++          carry = 0;
++          pA->a[i] = x;
++        }
++      }
++    }else{
++      signed char *aA, *aB;
++      int borrow = 0;
++      rc = memcmp(pA->a, pB->a, nDigit);
++      if( rc<0 ){
++        aA = pB->a;
++        aB = pA->a;
++        pA->sign = !pA->sign;
++      }else{
++        aA = pA->a;
++        aB = pB->a;
++      }
++      for(i=nDigit-1; i>=0; i--){
++        int x = aA[i] - aB[i] - borrow;
++        if( x<0 ){
++          pA->a[i] = x+10;
++          borrow = 1;
++        }else{
++          pA->a[i] = x;
++          borrow = 0;
++        }
++      }
++    }
++  }
++}
++
++/*
++** Multiply A by B.   A := A * B
++**
++** All significant digits after the decimal point are retained.
++** Trailing zeros after the decimal point are omitted as long as
++** the number of digits after the decimal point is no less than
++** either the number of digits in either input.
++*/
++static void decimalMul(Decimal *pA, Decimal *pB){
++  signed char *acc = 0;
++  int i, j, k;
++  int minFrac;
++
++  if( pA==0 || pA->oom || pA->isNull
++   || pB==0 || pB->oom || pB->isNull 
++  ){
++    goto mul_end;
++  }
++  acc = sqlite3_malloc64( pA->nDigit + pB->nDigit + 2 );
++  if( acc==0 ){
++    pA->oom = 1;
++    goto mul_end;
++  }
++  memset(acc, 0, pA->nDigit + pB->nDigit + 2);
++  minFrac = pA->nFrac;
++  if( pB->nFrac<minFrac ) minFrac = pB->nFrac;
++  for(i=pA->nDigit-1; i>=0; i--){
++    signed char f = pA->a[i];
++    int carry = 0, x;
++    for(j=pB->nDigit-1, k=i+j+3; j>=0; j--, k--){
++      x = acc[k] + f*pB->a[j] + carry;
++      acc[k] = x%10;
++      carry = x/10;
++    }
++    x = acc[k] + carry;
++    acc[k] = x%10;
++    acc[k-1] += x/10;
++  }
++  sqlite3_free(pA->a);
++  pA->a = acc;
++  acc = 0;
++  pA->nDigit += pB->nDigit + 2;
++  pA->nFrac += pB->nFrac;
++  pA->sign ^= pB->sign;
++  while( pA->nFrac>minFrac && pA->a[pA->nDigit-1]==0 ){
++    pA->nFrac--;
++    pA->nDigit--;
++  }
++
++mul_end:
++  sqlite3_free(acc);
++}
++
++/*
++** Create a new Decimal object that contains an integer power of 2.
++*/
++static Decimal *decimalPow2(int N){
++  Decimal *pA = 0;      /* The result to be returned */
++  Decimal *pX = 0;      /* Multiplier */
++  if( N<-20000 || N>20000 ) goto pow2_fault;
++  pA = decimalNewFromText("1.0", 3);
++  if( pA==0 || pA->oom ) goto pow2_fault;
++  if( N==0 ) return pA;
++  if( N>0 ){
++    pX = decimalNewFromText("2.0", 3);
++  }else{
++    N = -N;
++    pX = decimalNewFromText("0.5", 3);
++  }
++  if( pX==0 || pX->oom ) goto pow2_fault;
++  while( 1 /* Exit by break */ ){
++    if( N & 1 ){
++      decimalMul(pA, pX);
++      if( pA->oom ) goto pow2_fault;
++    }
++    N >>= 1;
++    if( N==0 ) break;
++    decimalMul(pX, pX);
++  }
++  decimal_free(pX);
++  return pA;
++
++pow2_fault:
++  decimal_free(pA);
++  decimal_free(pX);
++  return 0;
++}
++
++/*
++** Use an IEEE754 binary64 ("double") to generate a new Decimal object.
++*/
++static Decimal *decimalFromDouble(double r){
++  sqlite3_int64 m, a;
++  int e;
++  int isNeg;
++  Decimal *pA;
++  Decimal *pX;
++  char zNum[100];
++  if( r<0.0 ){
++    isNeg = 1;
++    r = -r;
++  }else{
++    isNeg = 0;
++  }
++  memcpy(&a,&r,sizeof(a));
++  if( a==0 ){
++    e = 0;
++    m = 0;
++  }else{
++    e = a>>52;
++    m = a & ((((sqlite3_int64)1)<<52)-1);
++    if( e==0 ){
++      m <<= 1;
++    }else{
++      m |= ((sqlite3_int64)1)<<52;
++    }
++    while( e<1075 && m>0 && (m&1)==0 ){
++      m >>= 1;
++      e++;
++    }
++    if( isNeg ) m = -m;
++    e = e - 1075;
++    if( e>971 ){
++      return 0;  /* A NaN or an Infinity */
++    }
++  }
++
++  /* At this point m is the integer significand and e is the exponent */
++  sqlite3_snprintf(sizeof(zNum), zNum, "%lld", m);
++  pA = decimalNewFromText(zNum, (int)strlen(zNum));
++  pX = decimalPow2(e);
++  decimalMul(pA, pX);
++  decimal_free(pX);
++  return pA;
++}
++
++/*
++** SQL Function:   decimal(X)
++** OR:             decimal_exp(X)
++**
++** Convert input X into decimal and then back into text.
++**
++** If X is originally a float, then a full decimal expansion of that floating
++** point value is done.  Or if X is an 8-byte blob, it is interpreted
++** as a float and similarly expanded.
++**
++** The decimal_exp(X) function returns the result in exponential notation.
++** decimal(X) returns a complete decimal, without the e+NNN at the end.
++*/
++static void decimalFunc(
++  sqlite3_context *context,
++  int argc,
++  sqlite3_value **argv
++){
++  Decimal *p =  decimal_new(context, argv[0], 0);
++  UNUSED_PARAMETER(argc);
++  if( p ){
++    if( sqlite3_user_data(context)!=0 ){
++      decimal_result_sci(context, p);
++    }else{
++      decimal_result(context, p);
++    }
++    decimal_free(p);
++  }
++}
++
++/*
++** Compare text in decimal order.
++*/
++static int decimalCollFunc(
++  void *notUsed,
++  int nKey1, const void *pKey1,
++  int nKey2, const void *pKey2
++){
++  const unsigned char *zA = (const unsigned char*)pKey1;
++  const unsigned char *zB = (const unsigned char*)pKey2;
++  Decimal *pA = decimalNewFromText((const char*)zA, nKey1);
++  Decimal *pB = decimalNewFromText((const char*)zB, nKey2);
++  int rc;
++  UNUSED_PARAMETER(notUsed);
++  if( pA==0 || pB==0 ){
++    rc = 0;
++  }else{
++    rc = decimal_cmp(pA, pB);
++  }
++  decimal_free(pA);
++  decimal_free(pB);
++  return rc;
++}
++
++
++/*
++** SQL Function:   decimal_add(X, Y)
++**                 decimal_sub(X, Y)
++**
++** Return the sum or difference of X and Y.
++*/
++static void decimalAddFunc(
++  sqlite3_context *context,
++  int argc,
++  sqlite3_value **argv
++){
++  Decimal *pA = decimal_new(context, argv[0], 1);
++  Decimal *pB = decimal_new(context, argv[1], 1);
++  UNUSED_PARAMETER(argc);
++  decimal_add(pA, pB);
++  decimal_result(context, pA);
++  decimal_free(pA);
++  decimal_free(pB);
++}
++static void decimalSubFunc(
++  sqlite3_context *context,
++  int argc,
++  sqlite3_value **argv
++){
++  Decimal *pA = decimal_new(context, argv[0], 1);
++  Decimal *pB = decimal_new(context, argv[1], 1);
++  UNUSED_PARAMETER(argc);
++  if( pB ){
++    pB->sign = !pB->sign;
++    decimal_add(pA, pB);
++    decimal_result(context, pA);
++  }
++  decimal_free(pA);
++  decimal_free(pB);
++}
++
++/* Aggregate function:   decimal_sum(X)
++**
++** Works like sum() except that it uses decimal arithmetic for unlimited
++** precision.
++*/
++static void decimalSumStep(
++  sqlite3_context *context,
++  int argc,
++  sqlite3_value **argv
++){
++  Decimal *p;
++  Decimal *pArg;
++  UNUSED_PARAMETER(argc);
++  p = sqlite3_aggregate_context(context, sizeof(*p));
++  if( p==0 ) return;
++  if( !p->isInit ){
++    p->isInit = 1;
++    p->a = sqlite3_malloc(2);
++    if( p->a==0 ){
++      p->oom = 1;
++    }else{
++      p->a[0] = 0;
++    }
++    p->nDigit = 1;
++    p->nFrac = 0;
++  }
++  if( sqlite3_value_type(argv[0])==SQLITE_NULL ) return;
++  pArg = decimal_new(context, argv[0], 1);
++  decimal_add(p, pArg);
++  decimal_free(pArg);
++}
++static void decimalSumInverse(
++  sqlite3_context *context,
++  int argc,
++  sqlite3_value **argv
++){
++  Decimal *p;
++  Decimal *pArg;
++  UNUSED_PARAMETER(argc);
++  p = sqlite3_aggregate_context(context, sizeof(*p));
++  if( p==0 ) return;
++  if( sqlite3_value_type(argv[0])==SQLITE_NULL ) return;
++  pArg = decimal_new(context, argv[0], 1);
++  if( pArg ) pArg->sign = !pArg->sign;
++  decimal_add(p, pArg);
++  decimal_free(pArg);
++}
++static void decimalSumValue(sqlite3_context *context){
++  Decimal *p = sqlite3_aggregate_context(context, 0);
++  if( p==0 ) return;
++  decimal_result(context, p);
++}
++static void decimalSumFinalize(sqlite3_context *context){
++  Decimal *p = sqlite3_aggregate_context(context, 0);
++  if( p==0 ) return;
++  decimal_result(context, p);
++  decimal_clear(p);
++}
++
++/*
++** SQL Function:   decimal_mul(X, Y)
++**
++** Return the product of X and Y.
++*/
++static void decimalMulFunc(
++  sqlite3_context *context,
++  int argc,
++  sqlite3_value **argv
++){
++  Decimal *pA = decimal_new(context, argv[0], 1);
++  Decimal *pB = decimal_new(context, argv[1], 1);
++  UNUSED_PARAMETER(argc);
++  if( pA==0 || pA->oom || pA->isNull
++   || pB==0 || pB->oom || pB->isNull 
++  ){
++    goto mul_end;
++  }
++  decimalMul(pA, pB);
++  if( pA->oom ){
++    goto mul_end;
++  }
++  decimal_result(context, pA);
++
++mul_end:
++  decimal_free(pA);
++  decimal_free(pB);
++}
++
++/*
++** SQL Function:   decimal_pow2(N)
++**
++** Return the N-th power of 2.  N must be an integer.
++*/
++static void decimalPow2Func(
++  sqlite3_context *context,
++  int argc,
++  sqlite3_value **argv
++){
++  UNUSED_PARAMETER(argc);
++  if( sqlite3_value_type(argv[0])==SQLITE_INTEGER ){
++    Decimal *pA = decimalPow2(sqlite3_value_int(argv[0]));
++    decimal_result_sci(context, pA);
++    decimal_free(pA);
++  }
++}
++
++#ifdef _WIN32
++__declspec(dllexport)
++#endif
++int sqlite3_decimal_init(
++  sqlite3 *db, 
++  char **pzErrMsg, 
++  const sqlite3_api_routines *pApi
++){
++  int rc = SQLITE_OK;
++  static const struct {
++    const char *zFuncName;
++    int nArg;
++    int iArg;
++    void (*xFunc)(sqlite3_context*,int,sqlite3_value**);
++  } aFunc[] = {
++    { "decimal",       1, 0,  decimalFunc        },
++    { "decimal_exp",   1, 1,  decimalFunc        },
++    { "decimal_cmp",   2, 0,  decimalCmpFunc     },
++    { "decimal_add",   2, 0,  decimalAddFunc     },
++    { "decimal_sub",   2, 0,  decimalSubFunc     },
++    { "decimal_mul",   2, 0,  decimalMulFunc     },
++    { "decimal_pow2",  1, 0,  decimalPow2Func    },
++  };
++  unsigned int i;
++  (void)pzErrMsg;  /* Unused parameter */
++
++  SQLITE_EXTENSION_INIT2(pApi);
++
++  for(i=0; i<(int)(sizeof(aFunc)/sizeof(aFunc[0])) && rc==SQLITE_OK; i++){
++    rc = sqlite3_create_function(db, aFunc[i].zFuncName, aFunc[i].nArg,
++                   SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
++                   aFunc[i].iArg ? db : 0, aFunc[i].xFunc, 0, 0);
++  }
++  if( rc==SQLITE_OK ){
++    rc = sqlite3_create_window_function(db, "decimal_sum", 1,
++                   SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC, 0,
++                   decimalSumStep, decimalSumFinalize,
++                   decimalSumValue, decimalSumInverse, 0);
++  }
++  if( rc==SQLITE_OK ){
++    rc = sqlite3_create_collation(db, "decimal", SQLITE_UTF8,
++                                  0, decimalCollFunc);
++  }
++  return rc;
++}
++
++#endif /* OP_SQLITE_ENABLE_DECIMAL */
+diff --git a/cpp/sqlite3ext.h b/cpp/sqlite3ext.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..cf775dfbde0fdf634df5e64f9bef34e050e67df1
+--- /dev/null
++++ b/cpp/sqlite3ext.h
+@@ -0,0 +1,723 @@
++/*
++** 2006 June 7
++**
++** The author disclaims copyright to this source code.  In place of
++** a legal notice, here is a blessing:
++**
++**    May you do good and not evil.
++**    May you find forgiveness for yourself and forgive others.
++**    May you share freely, never taking more than you give.
++**
++*************************************************************************
++** This header file defines the SQLite interface for use by
++** shared libraries that want to be imported as extensions into
++** an SQLite instance.  Shared libraries that intend to be loaded
++** as extensions by SQLite should #include this file instead of 
++** sqlite3.h.
++*/
++#ifndef SQLITE3EXT_H
++#define SQLITE3EXT_H
++#include "sqlite3.h"
++
++/*
++** The following structure holds pointers to all of the SQLite API
++** routines.
++**
++** WARNING:  In order to maintain backwards compatibility, add new
++** interfaces to the end of this structure only.  If you insert new
++** interfaces in the middle of this structure, then older different
++** versions of SQLite will not be able to load each other's shared
++** libraries!
++*/
++struct sqlite3_api_routines {
++  void * (*aggregate_context)(sqlite3_context*,int nBytes);
++  int  (*aggregate_count)(sqlite3_context*);
++  int  (*bind_blob)(sqlite3_stmt*,int,const void*,int n,void(*)(void*));
++  int  (*bind_double)(sqlite3_stmt*,int,double);
++  int  (*bind_int)(sqlite3_stmt*,int,int);
++  int  (*bind_int64)(sqlite3_stmt*,int,sqlite_int64);
++  int  (*bind_null)(sqlite3_stmt*,int);
++  int  (*bind_parameter_count)(sqlite3_stmt*);
++  int  (*bind_parameter_index)(sqlite3_stmt*,const char*zName);
++  const char * (*bind_parameter_name)(sqlite3_stmt*,int);
++  int  (*bind_text)(sqlite3_stmt*,int,const char*,int n,void(*)(void*));
++  int  (*bind_text16)(sqlite3_stmt*,int,const void*,int,void(*)(void*));
++  int  (*bind_value)(sqlite3_stmt*,int,const sqlite3_value*);
++  int  (*busy_handler)(sqlite3*,int(*)(void*,int),void*);
++  int  (*busy_timeout)(sqlite3*,int ms);
++  int  (*changes)(sqlite3*);
++  int  (*close)(sqlite3*);
++  int  (*collation_needed)(sqlite3*,void*,void(*)(void*,sqlite3*,
++                           int eTextRep,const char*));
++  int  (*collation_needed16)(sqlite3*,void*,void(*)(void*,sqlite3*,
++                             int eTextRep,const void*));
++  const void * (*column_blob)(sqlite3_stmt*,int iCol);
++  int  (*column_bytes)(sqlite3_stmt*,int iCol);
++  int  (*column_bytes16)(sqlite3_stmt*,int iCol);
++  int  (*column_count)(sqlite3_stmt*pStmt);
++  const char * (*column_database_name)(sqlite3_stmt*,int);
++  const void * (*column_database_name16)(sqlite3_stmt*,int);
++  const char * (*column_decltype)(sqlite3_stmt*,int i);
++  const void * (*column_decltype16)(sqlite3_stmt*,int);
++  double  (*column_double)(sqlite3_stmt*,int iCol);
++  int  (*column_int)(sqlite3_stmt*,int iCol);
++  sqlite_int64  (*column_int64)(sqlite3_stmt*,int iCol);
++  const char * (*column_name)(sqlite3_stmt*,int);
++  const void * (*column_name16)(sqlite3_stmt*,int);
++  const char * (*column_origin_name)(sqlite3_stmt*,int);
++  const void * (*column_origin_name16)(sqlite3_stmt*,int);
++  const char * (*column_table_name)(sqlite3_stmt*,int);
++  const void * (*column_table_name16)(sqlite3_stmt*,int);
++  const unsigned char * (*column_text)(sqlite3_stmt*,int iCol);
++  const void * (*column_text16)(sqlite3_stmt*,int iCol);
++  int  (*column_type)(sqlite3_stmt*,int iCol);
++  sqlite3_value* (*column_value)(sqlite3_stmt*,int iCol);
++  void * (*commit_hook)(sqlite3*,int(*)(void*),void*);
++  int  (*complete)(const char*sql);
++  int  (*complete16)(const void*sql);
++  int  (*create_collation)(sqlite3*,const char*,int,void*,
++                           int(*)(void*,int,const void*,int,const void*));
++  int  (*create_collation16)(sqlite3*,const void*,int,void*,
++                             int(*)(void*,int,const void*,int,const void*));
++  int  (*create_function)(sqlite3*,const char*,int,int,void*,
++                          void (*xFunc)(sqlite3_context*,int,sqlite3_value**),
++                          void (*xStep)(sqlite3_context*,int,sqlite3_value**),
++                          void (*xFinal)(sqlite3_context*));
++  int  (*create_function16)(sqlite3*,const void*,int,int,void*,
++                            void (*xFunc)(sqlite3_context*,int,sqlite3_value**),
++                            void (*xStep)(sqlite3_context*,int,sqlite3_value**),
++                            void (*xFinal)(sqlite3_context*));
++  int (*create_module)(sqlite3*,const char*,const sqlite3_module*,void*);
++  int  (*data_count)(sqlite3_stmt*pStmt);
++  sqlite3 * (*db_handle)(sqlite3_stmt*);
++  int (*declare_vtab)(sqlite3*,const char*);
++  int  (*enable_shared_cache)(int);
++  int  (*errcode)(sqlite3*db);
++  const char * (*errmsg)(sqlite3*);
++  const void * (*errmsg16)(sqlite3*);
++  int  (*exec)(sqlite3*,const char*,sqlite3_callback,void*,char**);
++  int  (*expired)(sqlite3_stmt*);
++  int  (*finalize)(sqlite3_stmt*pStmt);
++  void  (*free)(void*);
++  void  (*free_table)(char**result);
++  int  (*get_autocommit)(sqlite3*);
++  void * (*get_auxdata)(sqlite3_context*,int);
++  int  (*get_table)(sqlite3*,const char*,char***,int*,int*,char**);
++  int  (*global_recover)(void);
++  void  (*interruptx)(sqlite3*);
++  sqlite_int64  (*last_insert_rowid)(sqlite3*);
++  const char * (*libversion)(void);
++  int  (*libversion_number)(void);
++  void *(*malloc)(int);
++  char * (*mprintf)(const char*,...);
++  int  (*open)(const char*,sqlite3**);
++  int  (*open16)(const void*,sqlite3**);
++  int  (*prepare)(sqlite3*,const char*,int,sqlite3_stmt**,const char**);
++  int  (*prepare16)(sqlite3*,const void*,int,sqlite3_stmt**,const void**);
++  void * (*profile)(sqlite3*,void(*)(void*,const char*,sqlite_uint64),void*);
++  void  (*progress_handler)(sqlite3*,int,int(*)(void*),void*);
++  void *(*realloc)(void*,int);
++  int  (*reset)(sqlite3_stmt*pStmt);
++  void  (*result_blob)(sqlite3_context*,const void*,int,void(*)(void*));
++  void  (*result_double)(sqlite3_context*,double);
++  void  (*result_error)(sqlite3_context*,const char*,int);
++  void  (*result_error16)(sqlite3_context*,const void*,int);
++  void  (*result_int)(sqlite3_context*,int);
++  void  (*result_int64)(sqlite3_context*,sqlite_int64);
++  void  (*result_null)(sqlite3_context*);
++  void  (*result_text)(sqlite3_context*,const char*,int,void(*)(void*));
++  void  (*result_text16)(sqlite3_context*,const void*,int,void(*)(void*));
++  void  (*result_text16be)(sqlite3_context*,const void*,int,void(*)(void*));
++  void  (*result_text16le)(sqlite3_context*,const void*,int,void(*)(void*));
++  void  (*result_value)(sqlite3_context*,sqlite3_value*);
++  void * (*rollback_hook)(sqlite3*,void(*)(void*),void*);
++  int  (*set_authorizer)(sqlite3*,int(*)(void*,int,const char*,const char*,
++                         const char*,const char*),void*);
++  void  (*set_auxdata)(sqlite3_context*,int,void*,void (*)(void*));
++  char * (*xsnprintf)(int,char*,const char*,...);
++  int  (*step)(sqlite3_stmt*);
++  int  (*table_column_metadata)(sqlite3*,const char*,const char*,const char*,
++                                char const**,char const**,int*,int*,int*);
++  void  (*thread_cleanup)(void);
++  int  (*total_changes)(sqlite3*);
++  void * (*trace)(sqlite3*,void(*xTrace)(void*,const char*),void*);
++  int  (*transfer_bindings)(sqlite3_stmt*,sqlite3_stmt*);
++  void * (*update_hook)(sqlite3*,void(*)(void*,int ,char const*,char const*,
++                                         sqlite_int64),void*);
++  void * (*user_data)(sqlite3_context*);
++  const void * (*value_blob)(sqlite3_value*);
++  int  (*value_bytes)(sqlite3_value*);
++  int  (*value_bytes16)(sqlite3_value*);
++  double  (*value_double)(sqlite3_value*);
++  int  (*value_int)(sqlite3_value*);
++  sqlite_int64  (*value_int64)(sqlite3_value*);
++  int  (*value_numeric_type)(sqlite3_value*);
++  const unsigned char * (*value_text)(sqlite3_value*);
++  const void * (*value_text16)(sqlite3_value*);
++  const void * (*value_text16be)(sqlite3_value*);
++  const void * (*value_text16le)(sqlite3_value*);
++  int  (*value_type)(sqlite3_value*);
++  char *(*vmprintf)(const char*,va_list);
++  /* Added ??? */
++  int (*overload_function)(sqlite3*, const char *zFuncName, int nArg);
++  /* Added by 3.3.13 */
++  int (*prepare_v2)(sqlite3*,const char*,int,sqlite3_stmt**,const char**);
++  int (*prepare16_v2)(sqlite3*,const void*,int,sqlite3_stmt**,const void**);
++  int (*clear_bindings)(sqlite3_stmt*);
++  /* Added by 3.4.1 */
++  int (*create_module_v2)(sqlite3*,const char*,const sqlite3_module*,void*,
++                          void (*xDestroy)(void *));
++  /* Added by 3.5.0 */
++  int (*bind_zeroblob)(sqlite3_stmt*,int,int);
++  int (*blob_bytes)(sqlite3_blob*);
++  int (*blob_close)(sqlite3_blob*);
++  int (*blob_open)(sqlite3*,const char*,const char*,const char*,sqlite3_int64,
++                   int,sqlite3_blob**);
++  int (*blob_read)(sqlite3_blob*,void*,int,int);
++  int (*blob_write)(sqlite3_blob*,const void*,int,int);
++  int (*create_collation_v2)(sqlite3*,const char*,int,void*,
++                             int(*)(void*,int,const void*,int,const void*),
++                             void(*)(void*));
++  int (*file_control)(sqlite3*,const char*,int,void*);
++  sqlite3_int64 (*memory_highwater)(int);
++  sqlite3_int64 (*memory_used)(void);
++  sqlite3_mutex *(*mutex_alloc)(int);
++  void (*mutex_enter)(sqlite3_mutex*);
++  void (*mutex_free)(sqlite3_mutex*);
++  void (*mutex_leave)(sqlite3_mutex*);
++  int (*mutex_try)(sqlite3_mutex*);
++  int (*open_v2)(const char*,sqlite3**,int,const char*);
++  int (*release_memory)(int);
++  void (*result_error_nomem)(sqlite3_context*);
++  void (*result_error_toobig)(sqlite3_context*);
++  int (*sleep)(int);
++  void (*soft_heap_limit)(int);
++  sqlite3_vfs *(*vfs_find)(const char*);
++  int (*vfs_register)(sqlite3_vfs*,int);
++  int (*vfs_unregister)(sqlite3_vfs*);
++  int (*xthreadsafe)(void);
++  void (*result_zeroblob)(sqlite3_context*,int);
++  void (*result_error_code)(sqlite3_context*,int);
++  int (*test_control)(int, ...);
++  void (*randomness)(int,void*);
++  sqlite3 *(*context_db_handle)(sqlite3_context*);
++  int (*extended_result_codes)(sqlite3*,int);
++  int (*limit)(sqlite3*,int,int);
++  sqlite3_stmt *(*next_stmt)(sqlite3*,sqlite3_stmt*);
++  const char *(*sql)(sqlite3_stmt*);
++  int (*status)(int,int*,int*,int);
++  int (*backup_finish)(sqlite3_backup*);
++  sqlite3_backup *(*backup_init)(sqlite3*,const char*,sqlite3*,const char*);
++  int (*backup_pagecount)(sqlite3_backup*);
++  int (*backup_remaining)(sqlite3_backup*);
++  int (*backup_step)(sqlite3_backup*,int);
++  const char *(*compileoption_get)(int);
++  int (*compileoption_used)(const char*);
++  int (*create_function_v2)(sqlite3*,const char*,int,int,void*,
++                            void (*xFunc)(sqlite3_context*,int,sqlite3_value**),
++                            void (*xStep)(sqlite3_context*,int,sqlite3_value**),
++                            void (*xFinal)(sqlite3_context*),
++                            void(*xDestroy)(void*));
++  int (*db_config)(sqlite3*,int,...);
++  sqlite3_mutex *(*db_mutex)(sqlite3*);
++  int (*db_status)(sqlite3*,int,int*,int*,int);
++  int (*extended_errcode)(sqlite3*);
++  void (*log)(int,const char*,...);
++  sqlite3_int64 (*soft_heap_limit64)(sqlite3_int64);
++  const char *(*sourceid)(void);
++  int (*stmt_status)(sqlite3_stmt*,int,int);
++  int (*strnicmp)(const char*,const char*,int);
++  int (*unlock_notify)(sqlite3*,void(*)(void**,int),void*);
++  int (*wal_autocheckpoint)(sqlite3*,int);
++  int (*wal_checkpoint)(sqlite3*,const char*);
++  void *(*wal_hook)(sqlite3*,int(*)(void*,sqlite3*,const char*,int),void*);
++  int (*blob_reopen)(sqlite3_blob*,sqlite3_int64);
++  int (*vtab_config)(sqlite3*,int op,...);
++  int (*vtab_on_conflict)(sqlite3*);
++  /* Version 3.7.16 and later */
++  int (*close_v2)(sqlite3*);
++  const char *(*db_filename)(sqlite3*,const char*);
++  int (*db_readonly)(sqlite3*,const char*);
++  int (*db_release_memory)(sqlite3*);
++  const char *(*errstr)(int);
++  int (*stmt_busy)(sqlite3_stmt*);
++  int (*stmt_readonly)(sqlite3_stmt*);
++  int (*stricmp)(const char*,const char*);
++  int (*uri_boolean)(const char*,const char*,int);
++  sqlite3_int64 (*uri_int64)(const char*,const char*,sqlite3_int64);
++  const char *(*uri_parameter)(const char*,const char*);
++  char *(*xvsnprintf)(int,char*,const char*,va_list);
++  int (*wal_checkpoint_v2)(sqlite3*,const char*,int,int*,int*);
++  /* Version 3.8.7 and later */
++  int (*auto_extension)(void(*)(void));
++  int (*bind_blob64)(sqlite3_stmt*,int,const void*,sqlite3_uint64,
++                     void(*)(void*));
++  int (*bind_text64)(sqlite3_stmt*,int,const char*,sqlite3_uint64,
++                      void(*)(void*),unsigned char);
++  int (*cancel_auto_extension)(void(*)(void));
++  int (*load_extension)(sqlite3*,const char*,const char*,char**);
++  void *(*malloc64)(sqlite3_uint64);
++  sqlite3_uint64 (*msize)(void*);
++  void *(*realloc64)(void*,sqlite3_uint64);
++  void (*reset_auto_extension)(void);
++  void (*result_blob64)(sqlite3_context*,const void*,sqlite3_uint64,
++                        void(*)(void*));
++  void (*result_text64)(sqlite3_context*,const char*,sqlite3_uint64,
++                         void(*)(void*), unsigned char);
++  int (*strglob)(const char*,const char*);
++  /* Version 3.8.11 and later */
++  sqlite3_value *(*value_dup)(const sqlite3_value*);
++  void (*value_free)(sqlite3_value*);
++  int (*result_zeroblob64)(sqlite3_context*,sqlite3_uint64);
++  int (*bind_zeroblob64)(sqlite3_stmt*, int, sqlite3_uint64);
++  /* Version 3.9.0 and later */
++  unsigned int (*value_subtype)(sqlite3_value*);
++  void (*result_subtype)(sqlite3_context*,unsigned int);
++  /* Version 3.10.0 and later */
++  int (*status64)(int,sqlite3_int64*,sqlite3_int64*,int);
++  int (*strlike)(const char*,const char*,unsigned int);
++  int (*db_cacheflush)(sqlite3*);
++  /* Version 3.12.0 and later */
++  int (*system_errno)(sqlite3*);
++  /* Version 3.14.0 and later */
++  int (*trace_v2)(sqlite3*,unsigned,int(*)(unsigned,void*,void*,void*),void*);
++  char *(*expanded_sql)(sqlite3_stmt*);
++  /* Version 3.18.0 and later */
++  void (*set_last_insert_rowid)(sqlite3*,sqlite3_int64);
++  /* Version 3.20.0 and later */
++  int (*prepare_v3)(sqlite3*,const char*,int,unsigned int,
++                    sqlite3_stmt**,const char**);
++  int (*prepare16_v3)(sqlite3*,const void*,int,unsigned int,
++                      sqlite3_stmt**,const void**);
++  int (*bind_pointer)(sqlite3_stmt*,int,void*,const char*,void(*)(void*));
++  void (*result_pointer)(sqlite3_context*,void*,const char*,void(*)(void*));
++  void *(*value_pointer)(sqlite3_value*,const char*);
++  int (*vtab_nochange)(sqlite3_context*);
++  int (*value_nochange)(sqlite3_value*);
++  const char *(*vtab_collation)(sqlite3_index_info*,int);
++  /* Version 3.24.0 and later */
++  int (*keyword_count)(void);
++  int (*keyword_name)(int,const char**,int*);
++  int (*keyword_check)(const char*,int);
++  sqlite3_str *(*str_new)(sqlite3*);
++  char *(*str_finish)(sqlite3_str*);
++  void (*str_appendf)(sqlite3_str*, const char *zFormat, ...);
++  void (*str_vappendf)(sqlite3_str*, const char *zFormat, va_list);
++  void (*str_append)(sqlite3_str*, const char *zIn, int N);
++  void (*str_appendall)(sqlite3_str*, const char *zIn);
++  void (*str_appendchar)(sqlite3_str*, int N, char C);
++  void (*str_reset)(sqlite3_str*);
++  int (*str_errcode)(sqlite3_str*);
++  int (*str_length)(sqlite3_str*);
++  char *(*str_value)(sqlite3_str*);
++  /* Version 3.25.0 and later */
++  int (*create_window_function)(sqlite3*,const char*,int,int,void*,
++                            void (*xStep)(sqlite3_context*,int,sqlite3_value**),
++                            void (*xFinal)(sqlite3_context*),
++                            void (*xValue)(sqlite3_context*),
++                            void (*xInv)(sqlite3_context*,int,sqlite3_value**),
++                            void(*xDestroy)(void*));
++  /* Version 3.26.0 and later */
++  const char *(*normalized_sql)(sqlite3_stmt*);
++  /* Version 3.28.0 and later */
++  int (*stmt_isexplain)(sqlite3_stmt*);
++  int (*value_frombind)(sqlite3_value*);
++  /* Version 3.30.0 and later */
++  int (*drop_modules)(sqlite3*,const char**);
++  /* Version 3.31.0 and later */
++  sqlite3_int64 (*hard_heap_limit64)(sqlite3_int64);
++  const char *(*uri_key)(const char*,int);
++  const char *(*filename_database)(const char*);
++  const char *(*filename_journal)(const char*);
++  const char *(*filename_wal)(const char*);
++  /* Version 3.32.0 and later */
++  const char *(*create_filename)(const char*,const char*,const char*,
++                           int,const char**);
++  void (*free_filename)(const char*);
++  sqlite3_file *(*database_file_object)(const char*);
++  /* Version 3.34.0 and later */
++  int (*txn_state)(sqlite3*,const char*);
++  /* Version 3.36.1 and later */
++  sqlite3_int64 (*changes64)(sqlite3*);
++  sqlite3_int64 (*total_changes64)(sqlite3*);
++  /* Version 3.37.0 and later */
++  int (*autovacuum_pages)(sqlite3*,
++     unsigned int(*)(void*,const char*,unsigned int,unsigned int,unsigned int),
++     void*, void(*)(void*));
++  /* Version 3.38.0 and later */
++  int (*error_offset)(sqlite3*);
++  int (*vtab_rhs_value)(sqlite3_index_info*,int,sqlite3_value**);
++  int (*vtab_distinct)(sqlite3_index_info*);
++  int (*vtab_in)(sqlite3_index_info*,int,int);
++  int (*vtab_in_first)(sqlite3_value*,sqlite3_value**);
++  int (*vtab_in_next)(sqlite3_value*,sqlite3_value**);
++  /* Version 3.39.0 and later */
++  int (*deserialize)(sqlite3*,const char*,unsigned char*,
++                     sqlite3_int64,sqlite3_int64,unsigned);
++  unsigned char *(*serialize)(sqlite3*,const char *,sqlite3_int64*,
++                              unsigned int);
++  const char *(*db_name)(sqlite3*,int);
++  /* Version 3.40.0 and later */
++  int (*value_encoding)(sqlite3_value*);
++  /* Version 3.41.0 and later */
++  int (*is_interrupted)(sqlite3*);
++  /* Version 3.43.0 and later */
++  int (*stmt_explain)(sqlite3_stmt*,int);
++  /* Version 3.44.0 and later */
++  void *(*get_clientdata)(sqlite3*,const char*);
++  int (*set_clientdata)(sqlite3*, const char*, void*, void(*)(void*));
++  /* Version 3.50.0 and later */
++  int (*setlk_timeout)(sqlite3*,int,int);
++};
++
++/*
++** This is the function signature used for all extension entry points.  It
++** is also defined in the file "loadext.c".
++*/
++typedef int (*sqlite3_loadext_entry)(
++  sqlite3 *db,                       /* Handle to the database. */
++  char **pzErrMsg,                   /* Used to set error string on failure. */
++  const sqlite3_api_routines *pThunk /* Extension API function pointers. */
++);
++
++/*
++** The following macros redefine the API routines so that they are
++** redirected through the global sqlite3_api structure.
++**
++** This header file is also used by the loadext.c source file
++** (part of the main SQLite library - not an extension) so that
++** it can get access to the sqlite3_api_routines structure
++** definition.  But the main library does not want to redefine
++** the API.  So the redefinition macros are only valid if the
++** SQLITE_CORE macros is undefined.
++*/
++#if !defined(SQLITE_CORE) && !defined(SQLITE_OMIT_LOAD_EXTENSION)
++#define sqlite3_aggregate_context      sqlite3_api->aggregate_context
++#ifndef SQLITE_OMIT_DEPRECATED
++#define sqlite3_aggregate_count        sqlite3_api->aggregate_count
++#endif
++#define sqlite3_bind_blob              sqlite3_api->bind_blob
++#define sqlite3_bind_double            sqlite3_api->bind_double
++#define sqlite3_bind_int               sqlite3_api->bind_int
++#define sqlite3_bind_int64             sqlite3_api->bind_int64
++#define sqlite3_bind_null              sqlite3_api->bind_null
++#define sqlite3_bind_parameter_count   sqlite3_api->bind_parameter_count
++#define sqlite3_bind_parameter_index   sqlite3_api->bind_parameter_index
++#define sqlite3_bind_parameter_name    sqlite3_api->bind_parameter_name
++#define sqlite3_bind_text              sqlite3_api->bind_text
++#define sqlite3_bind_text16            sqlite3_api->bind_text16
++#define sqlite3_bind_value             sqlite3_api->bind_value
++#define sqlite3_busy_handler           sqlite3_api->busy_handler
++#define sqlite3_busy_timeout           sqlite3_api->busy_timeout
++#define sqlite3_changes                sqlite3_api->changes
++#define sqlite3_close                  sqlite3_api->close
++#define sqlite3_collation_needed       sqlite3_api->collation_needed
++#define sqlite3_collation_needed16     sqlite3_api->collation_needed16
++#define sqlite3_column_blob            sqlite3_api->column_blob
++#define sqlite3_column_bytes           sqlite3_api->column_bytes
++#define sqlite3_column_bytes16         sqlite3_api->column_bytes16
++#define sqlite3_column_count           sqlite3_api->column_count
++#define sqlite3_column_database_name   sqlite3_api->column_database_name
++#define sqlite3_column_database_name16 sqlite3_api->column_database_name16
++#define sqlite3_column_decltype        sqlite3_api->column_decltype
++#define sqlite3_column_decltype16      sqlite3_api->column_decltype16
++#define sqlite3_column_double          sqlite3_api->column_double
++#define sqlite3_column_int             sqlite3_api->column_int
++#define sqlite3_column_int64           sqlite3_api->column_int64
++#define sqlite3_column_name            sqlite3_api->column_name
++#define sqlite3_column_name16          sqlite3_api->column_name16
++#define sqlite3_column_origin_name     sqlite3_api->column_origin_name
++#define sqlite3_column_origin_name16   sqlite3_api->column_origin_name16
++#define sqlite3_column_table_name      sqlite3_api->column_table_name
++#define sqlite3_column_table_name16    sqlite3_api->column_table_name16
++#define sqlite3_column_text            sqlite3_api->column_text
++#define sqlite3_column_text16          sqlite3_api->column_text16
++#define sqlite3_column_type            sqlite3_api->column_type
++#define sqlite3_column_value           sqlite3_api->column_value
++#define sqlite3_commit_hook            sqlite3_api->commit_hook
++#define sqlite3_complete               sqlite3_api->complete
++#define sqlite3_complete16             sqlite3_api->complete16
++#define sqlite3_create_collation       sqlite3_api->create_collation
++#define sqlite3_create_collation16     sqlite3_api->create_collation16
++#define sqlite3_create_function        sqlite3_api->create_function
++#define sqlite3_create_function16      sqlite3_api->create_function16
++#define sqlite3_create_module          sqlite3_api->create_module
++#define sqlite3_create_module_v2       sqlite3_api->create_module_v2
++#define sqlite3_data_count             sqlite3_api->data_count
++#define sqlite3_db_handle              sqlite3_api->db_handle
++#define sqlite3_declare_vtab           sqlite3_api->declare_vtab
++#define sqlite3_enable_shared_cache    sqlite3_api->enable_shared_cache
++#define sqlite3_errcode                sqlite3_api->errcode
++#define sqlite3_errmsg                 sqlite3_api->errmsg
++#define sqlite3_errmsg16               sqlite3_api->errmsg16
++#define sqlite3_exec                   sqlite3_api->exec
++#ifndef SQLITE_OMIT_DEPRECATED
++#define sqlite3_expired                sqlite3_api->expired
++#endif
++#define sqlite3_finalize               sqlite3_api->finalize
++#define sqlite3_free                   sqlite3_api->free
++#define sqlite3_free_table             sqlite3_api->free_table
++#define sqlite3_get_autocommit         sqlite3_api->get_autocommit
++#define sqlite3_get_auxdata            sqlite3_api->get_auxdata
++#define sqlite3_get_table              sqlite3_api->get_table
++#ifndef SQLITE_OMIT_DEPRECATED
++#define sqlite3_global_recover         sqlite3_api->global_recover
++#endif
++#define sqlite3_interrupt              sqlite3_api->interruptx
++#define sqlite3_last_insert_rowid      sqlite3_api->last_insert_rowid
++#define sqlite3_libversion             sqlite3_api->libversion
++#define sqlite3_libversion_number      sqlite3_api->libversion_number
++#define sqlite3_malloc                 sqlite3_api->malloc
++#define sqlite3_mprintf                sqlite3_api->mprintf
++#define sqlite3_open                   sqlite3_api->open
++#define sqlite3_open16                 sqlite3_api->open16
++#define sqlite3_prepare                sqlite3_api->prepare
++#define sqlite3_prepare16              sqlite3_api->prepare16
++#define sqlite3_prepare_v2             sqlite3_api->prepare_v2
++#define sqlite3_prepare16_v2           sqlite3_api->prepare16_v2
++#define sqlite3_profile                sqlite3_api->profile
++#define sqlite3_progress_handler       sqlite3_api->progress_handler
++#define sqlite3_realloc                sqlite3_api->realloc
++#define sqlite3_reset                  sqlite3_api->reset
++#define sqlite3_result_blob            sqlite3_api->result_blob
++#define sqlite3_result_double          sqlite3_api->result_double
++#define sqlite3_result_error           sqlite3_api->result_error
++#define sqlite3_result_error16         sqlite3_api->result_error16
++#define sqlite3_result_int             sqlite3_api->result_int
++#define sqlite3_result_int64           sqlite3_api->result_int64
++#define sqlite3_result_null            sqlite3_api->result_null
++#define sqlite3_result_text            sqlite3_api->result_text
++#define sqlite3_result_text16          sqlite3_api->result_text16
++#define sqlite3_result_text16be        sqlite3_api->result_text16be
++#define sqlite3_result_text16le        sqlite3_api->result_text16le
++#define sqlite3_result_value           sqlite3_api->result_value
++#define sqlite3_rollback_hook          sqlite3_api->rollback_hook
++#define sqlite3_set_authorizer         sqlite3_api->set_authorizer
++#define sqlite3_set_auxdata            sqlite3_api->set_auxdata
++#define sqlite3_snprintf               sqlite3_api->xsnprintf
++#define sqlite3_step                   sqlite3_api->step
++#define sqlite3_table_column_metadata  sqlite3_api->table_column_metadata
++#define sqlite3_thread_cleanup         sqlite3_api->thread_cleanup
++#define sqlite3_total_changes          sqlite3_api->total_changes
++#define sqlite3_trace                  sqlite3_api->trace
++#ifndef SQLITE_OMIT_DEPRECATED
++#define sqlite3_transfer_bindings      sqlite3_api->transfer_bindings
++#endif
++#define sqlite3_update_hook            sqlite3_api->update_hook
++#define sqlite3_user_data              sqlite3_api->user_data
++#define sqlite3_value_blob             sqlite3_api->value_blob
++#define sqlite3_value_bytes            sqlite3_api->value_bytes
++#define sqlite3_value_bytes16          sqlite3_api->value_bytes16
++#define sqlite3_value_double           sqlite3_api->value_double
++#define sqlite3_value_int              sqlite3_api->value_int
++#define sqlite3_value_int64            sqlite3_api->value_int64
++#define sqlite3_value_numeric_type     sqlite3_api->value_numeric_type
++#define sqlite3_value_text             sqlite3_api->value_text
++#define sqlite3_value_text16           sqlite3_api->value_text16
++#define sqlite3_value_text16be         sqlite3_api->value_text16be
++#define sqlite3_value_text16le         sqlite3_api->value_text16le
++#define sqlite3_value_type             sqlite3_api->value_type
++#define sqlite3_vmprintf               sqlite3_api->vmprintf
++#define sqlite3_vsnprintf              sqlite3_api->xvsnprintf
++#define sqlite3_overload_function      sqlite3_api->overload_function
++#define sqlite3_prepare_v2             sqlite3_api->prepare_v2
++#define sqlite3_prepare16_v2           sqlite3_api->prepare16_v2
++#define sqlite3_clear_bindings         sqlite3_api->clear_bindings
++#define sqlite3_bind_zeroblob          sqlite3_api->bind_zeroblob
++#define sqlite3_blob_bytes             sqlite3_api->blob_bytes
++#define sqlite3_blob_close             sqlite3_api->blob_close
++#define sqlite3_blob_open              sqlite3_api->blob_open
++#define sqlite3_blob_read              sqlite3_api->blob_read
++#define sqlite3_blob_write             sqlite3_api->blob_write
++#define sqlite3_create_collation_v2    sqlite3_api->create_collation_v2
++#define sqlite3_file_control           sqlite3_api->file_control
++#define sqlite3_memory_highwater       sqlite3_api->memory_highwater
++#define sqlite3_memory_used            sqlite3_api->memory_used
++#define sqlite3_mutex_alloc            sqlite3_api->mutex_alloc
++#define sqlite3_mutex_enter            sqlite3_api->mutex_enter
++#define sqlite3_mutex_free             sqlite3_api->mutex_free
++#define sqlite3_mutex_leave            sqlite3_api->mutex_leave
++#define sqlite3_mutex_try              sqlite3_api->mutex_try
++#define sqlite3_open_v2                sqlite3_api->open_v2
++#define sqlite3_release_memory         sqlite3_api->release_memory
++#define sqlite3_result_error_nomem     sqlite3_api->result_error_nomem
++#define sqlite3_result_error_toobig    sqlite3_api->result_error_toobig
++#define sqlite3_sleep                  sqlite3_api->sleep
++#define sqlite3_soft_heap_limit        sqlite3_api->soft_heap_limit
++#define sqlite3_vfs_find               sqlite3_api->vfs_find
++#define sqlite3_vfs_register           sqlite3_api->vfs_register
++#define sqlite3_vfs_unregister         sqlite3_api->vfs_unregister
++#define sqlite3_threadsafe             sqlite3_api->xthreadsafe
++#define sqlite3_result_zeroblob        sqlite3_api->result_zeroblob
++#define sqlite3_result_error_code      sqlite3_api->result_error_code
++#define sqlite3_test_control           sqlite3_api->test_control
++#define sqlite3_randomness             sqlite3_api->randomness
++#define sqlite3_context_db_handle      sqlite3_api->context_db_handle
++#define sqlite3_extended_result_codes  sqlite3_api->extended_result_codes
++#define sqlite3_limit                  sqlite3_api->limit
++#define sqlite3_next_stmt              sqlite3_api->next_stmt
++#define sqlite3_sql                    sqlite3_api->sql
++#define sqlite3_status                 sqlite3_api->status
++#define sqlite3_backup_finish          sqlite3_api->backup_finish
++#define sqlite3_backup_init            sqlite3_api->backup_init
++#define sqlite3_backup_pagecount       sqlite3_api->backup_pagecount
++#define sqlite3_backup_remaining       sqlite3_api->backup_remaining
++#define sqlite3_backup_step            sqlite3_api->backup_step
++#define sqlite3_compileoption_get      sqlite3_api->compileoption_get
++#define sqlite3_compileoption_used     sqlite3_api->compileoption_used
++#define sqlite3_create_function_v2     sqlite3_api->create_function_v2
++#define sqlite3_db_config              sqlite3_api->db_config
++#define sqlite3_db_mutex               sqlite3_api->db_mutex
++#define sqlite3_db_status              sqlite3_api->db_status
++#define sqlite3_extended_errcode       sqlite3_api->extended_errcode
++#define sqlite3_log                    sqlite3_api->log
++#define sqlite3_soft_heap_limit64      sqlite3_api->soft_heap_limit64
++#define sqlite3_sourceid               sqlite3_api->sourceid
++#define sqlite3_stmt_status            sqlite3_api->stmt_status
++#define sqlite3_strnicmp               sqlite3_api->strnicmp
++#define sqlite3_unlock_notify          sqlite3_api->unlock_notify
++#define sqlite3_wal_autocheckpoint     sqlite3_api->wal_autocheckpoint
++#define sqlite3_wal_checkpoint         sqlite3_api->wal_checkpoint
++#define sqlite3_wal_hook               sqlite3_api->wal_hook
++#define sqlite3_blob_reopen            sqlite3_api->blob_reopen
++#define sqlite3_vtab_config            sqlite3_api->vtab_config
++#define sqlite3_vtab_on_conflict       sqlite3_api->vtab_on_conflict
++/* Version 3.7.16 and later */
++#define sqlite3_close_v2               sqlite3_api->close_v2
++#define sqlite3_db_filename            sqlite3_api->db_filename
++#define sqlite3_db_readonly            sqlite3_api->db_readonly
++#define sqlite3_db_release_memory      sqlite3_api->db_release_memory
++#define sqlite3_errstr                 sqlite3_api->errstr
++#define sqlite3_stmt_busy              sqlite3_api->stmt_busy
++#define sqlite3_stmt_readonly          sqlite3_api->stmt_readonly
++#define sqlite3_stricmp                sqlite3_api->stricmp
++#define sqlite3_uri_boolean            sqlite3_api->uri_boolean
++#define sqlite3_uri_int64              sqlite3_api->uri_int64
++#define sqlite3_uri_parameter          sqlite3_api->uri_parameter
++#define sqlite3_uri_vsnprintf          sqlite3_api->xvsnprintf
++#define sqlite3_wal_checkpoint_v2      sqlite3_api->wal_checkpoint_v2
++/* Version 3.8.7 and later */
++#define sqlite3_auto_extension         sqlite3_api->auto_extension
++#define sqlite3_bind_blob64            sqlite3_api->bind_blob64
++#define sqlite3_bind_text64            sqlite3_api->bind_text64
++#define sqlite3_cancel_auto_extension  sqlite3_api->cancel_auto_extension
++#define sqlite3_load_extension         sqlite3_api->load_extension
++#define sqlite3_malloc64               sqlite3_api->malloc64
++#define sqlite3_msize                  sqlite3_api->msize
++#define sqlite3_realloc64              sqlite3_api->realloc64
++#define sqlite3_reset_auto_extension   sqlite3_api->reset_auto_extension
++#define sqlite3_result_blob64          sqlite3_api->result_blob64
++#define sqlite3_result_text64          sqlite3_api->result_text64
++#define sqlite3_strglob                sqlite3_api->strglob
++/* Version 3.8.11 and later */
++#define sqlite3_value_dup              sqlite3_api->value_dup
++#define sqlite3_value_free             sqlite3_api->value_free
++#define sqlite3_result_zeroblob64      sqlite3_api->result_zeroblob64
++#define sqlite3_bind_zeroblob64        sqlite3_api->bind_zeroblob64
++/* Version 3.9.0 and later */
++#define sqlite3_value_subtype          sqlite3_api->value_subtype
++#define sqlite3_result_subtype         sqlite3_api->result_subtype
++/* Version 3.10.0 and later */
++#define sqlite3_status64               sqlite3_api->status64
++#define sqlite3_strlike                sqlite3_api->strlike
++#define sqlite3_db_cacheflush          sqlite3_api->db_cacheflush
++/* Version 3.12.0 and later */
++#define sqlite3_system_errno           sqlite3_api->system_errno
++/* Version 3.14.0 and later */
++#define sqlite3_trace_v2               sqlite3_api->trace_v2
++#define sqlite3_expanded_sql           sqlite3_api->expanded_sql
++/* Version 3.18.0 and later */
++#define sqlite3_set_last_insert_rowid  sqlite3_api->set_last_insert_rowid
++/* Version 3.20.0 and later */
++#define sqlite3_prepare_v3             sqlite3_api->prepare_v3
++#define sqlite3_prepare16_v3           sqlite3_api->prepare16_v3
++#define sqlite3_bind_pointer           sqlite3_api->bind_pointer
++#define sqlite3_result_pointer         sqlite3_api->result_pointer
++#define sqlite3_value_pointer          sqlite3_api->value_pointer
++/* Version 3.22.0 and later */
++#define sqlite3_vtab_nochange          sqlite3_api->vtab_nochange
++#define sqlite3_value_nochange         sqlite3_api->value_nochange
++#define sqlite3_vtab_collation         sqlite3_api->vtab_collation
++/* Version 3.24.0 and later */
++#define sqlite3_keyword_count          sqlite3_api->keyword_count
++#define sqlite3_keyword_name           sqlite3_api->keyword_name
++#define sqlite3_keyword_check          sqlite3_api->keyword_check
++#define sqlite3_str_new                sqlite3_api->str_new
++#define sqlite3_str_finish             sqlite3_api->str_finish
++#define sqlite3_str_appendf            sqlite3_api->str_appendf
++#define sqlite3_str_vappendf           sqlite3_api->str_vappendf
++#define sqlite3_str_append             sqlite3_api->str_append
++#define sqlite3_str_appendall          sqlite3_api->str_appendall
++#define sqlite3_str_appendchar         sqlite3_api->str_appendchar
++#define sqlite3_str_reset              sqlite3_api->str_reset
++#define sqlite3_str_errcode            sqlite3_api->str_errcode
++#define sqlite3_str_length             sqlite3_api->str_length
++#define sqlite3_str_value              sqlite3_api->str_value
++/* Version 3.25.0 and later */
++#define sqlite3_create_window_function sqlite3_api->create_window_function
++/* Version 3.26.0 and later */
++#define sqlite3_normalized_sql         sqlite3_api->normalized_sql
++/* Version 3.28.0 and later */
++#define sqlite3_stmt_isexplain         sqlite3_api->stmt_isexplain
++#define sqlite3_value_frombind         sqlite3_api->value_frombind
++/* Version 3.30.0 and later */
++#define sqlite3_drop_modules           sqlite3_api->drop_modules
++/* Version 3.31.0 and later */
++#define sqlite3_hard_heap_limit64      sqlite3_api->hard_heap_limit64
++#define sqlite3_uri_key                sqlite3_api->uri_key
++#define sqlite3_filename_database      sqlite3_api->filename_database
++#define sqlite3_filename_journal       sqlite3_api->filename_journal
++#define sqlite3_filename_wal           sqlite3_api->filename_wal
++/* Version 3.32.0 and later */
++#define sqlite3_create_filename        sqlite3_api->create_filename
++#define sqlite3_free_filename          sqlite3_api->free_filename
++#define sqlite3_database_file_object   sqlite3_api->database_file_object
++/* Version 3.34.0 and later */
++#define sqlite3_txn_state              sqlite3_api->txn_state
++/* Version 3.36.1 and later */
++#define sqlite3_changes64              sqlite3_api->changes64
++#define sqlite3_total_changes64        sqlite3_api->total_changes64
++/* Version 3.37.0 and later */
++#define sqlite3_autovacuum_pages       sqlite3_api->autovacuum_pages
++/* Version 3.38.0 and later */
++#define sqlite3_error_offset           sqlite3_api->error_offset
++#define sqlite3_vtab_rhs_value         sqlite3_api->vtab_rhs_value
++#define sqlite3_vtab_distinct          sqlite3_api->vtab_distinct
++#define sqlite3_vtab_in                sqlite3_api->vtab_in
++#define sqlite3_vtab_in_first          sqlite3_api->vtab_in_first
++#define sqlite3_vtab_in_next           sqlite3_api->vtab_in_next
++/* Version 3.39.0 and later */
++#ifndef SQLITE_OMIT_DESERIALIZE
++#define sqlite3_deserialize            sqlite3_api->deserialize
++#define sqlite3_serialize              sqlite3_api->serialize
++#endif
++#define sqlite3_db_name                sqlite3_api->db_name
++/* Version 3.40.0 and later */
++#define sqlite3_value_encoding         sqlite3_api->value_encoding
++/* Version 3.41.0 and later */
++#define sqlite3_is_interrupted         sqlite3_api->is_interrupted
++/* Version 3.43.0 and later */
++#define sqlite3_stmt_explain           sqlite3_api->stmt_explain
++/* Version 3.44.0 and later */
++#define sqlite3_get_clientdata         sqlite3_api->get_clientdata
++#define sqlite3_set_clientdata         sqlite3_api->set_clientdata
++/* Version 3.50.0 and later */
++#define sqlite3_setlk_timeout          sqlite3_api->setlk_timeout
++#endif /* !defined(SQLITE_CORE) && !defined(SQLITE_OMIT_LOAD_EXTENSION) */
++
++#if !defined(SQLITE_CORE) && !defined(SQLITE_OMIT_LOAD_EXTENSION)
++  /* This case when the file really is being compiled as a loadable 
++  ** extension */
++# define SQLITE_EXTENSION_INIT1     const sqlite3_api_routines *sqlite3_api=0;
++# define SQLITE_EXTENSION_INIT2(v)  sqlite3_api=v;
++# define SQLITE_EXTENSION_INIT3     \
++    extern const sqlite3_api_routines *sqlite3_api;
++#else
++  /* This case when the file is being statically linked into the 
++  ** application */
++# define SQLITE_EXTENSION_INIT1     /*no-op*/
++# define SQLITE_EXTENSION_INIT2(v)  (void)v; /* unused parameter */
++# define SQLITE_EXTENSION_INIT3     /*no-op*/
++#endif
++
++#endif /* SQLITE3EXT_H */

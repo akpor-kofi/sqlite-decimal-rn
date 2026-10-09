@@ -1,0 +1,19 @@
+name: Build decimal WASM
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 4.0.9
+      - run: sudo apt-get update && sudo apt-get install -y tcl-dev jq
+      - run: ./scripts/build-wasm.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sqlite-decimal-wasm
+          path: dist/
