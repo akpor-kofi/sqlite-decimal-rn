@@ -60,16 +60,25 @@ Scratch tests were run outside the repositories and are not committed:
 - 10,000-row mixed-sign/high-precision aggregates and scoped expense/invoice
   summaries matched the CTE/Decimal baseline, including empty aggregates.
 - The iOS simulator executed the extension compiled with op-sqlite's SQLite 3.50.4.
-- Android ARM64 NDK compilation passed; no Android device was connected.
+- Android ARM64 NDK compilation and scalar/aggregate harness passed on an API 36
+  emulator; the standalone NDK 25 harness used 16 KB linker page alignment.
 - SQLCipher 3.50.4 compilation and decimal query harness passed.
 - Chrome PowerSync worker: IndexedDB and OPFS, 10,000 exact rows, window sums,
   database close/reopen and offline reads passed on SQLite 3.53.0.
+- WebKit IndexedDB PowerSync passed exact sums, reopen/offline reads and widget
+  parity. OPFS timed out with both stock and patched workers; it is not validated.
+- The pinned Linux artifact-build workflow passed.
 - Full app login/live sync and physical-device acceptance remain rollout checks.
 
 ## Upstream Work
 
-The intended upstream destinations are OP-Engineering/op-sqlite,
-rhashimoto/wa-sqlite, powersync-ja/wa-sqlite and PowerSync's extension documentation.
+Open upstream contributions:
+
+- [op-sqlite #468](https://github.com/OP-Engineering/op-sqlite/pull/468)
+- [wa-sqlite #376](https://github.com/rhashimoto/wa-sqlite/pull/376)
+- [PowerSync wa-sqlite #96](https://github.com/powersync-ja/wa-sqlite/pull/96)
+- [PowerSync docs #688](https://github.com/powersync-ja/powersync-docs/pull/688)
+
 The generic `SQLITE_WASM_EXTRA_INIT` hook makes other statically linked extensions
 possible with existing `CFILES_EXTRA` and `WASQLITE_EXTRA_DEFINES` build options.
 SQLite's own custom WASM-init documentation is the reference pattern. A forum
