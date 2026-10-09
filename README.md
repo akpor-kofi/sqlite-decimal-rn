@@ -49,8 +49,10 @@ not change ordinary SQL arithmetic. Normalize NULL/empty inputs to `'0'`, clamp
 negative outstanding balances to zero when that is the application contract, and
 normalize trailing fractional zeros for canonical output. The SQLite extension
 does not expose `decimal_valid`; validate inputs at the existing application boundary.
-Probe scalar, aggregate and window functions on the actual PowerSync connection
-before enabling extension SQL. Retain exact fallback queries for older binaries.
+Nukodes requires scalar, aggregate, window functions and decimal collation on the
+actual PowerSync connection. Missing support fails startup: native builds must
+include the extension, and all browser storage modes use the rebuilt worker.
+There is no arithmetic fallback for older binaries.
 
 ## Evidence
 
