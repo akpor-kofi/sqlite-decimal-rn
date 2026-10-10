@@ -8,8 +8,18 @@ replacement SQLite implementation or a new PowerSync adapter.
 
 `patches/op-sqlite-15.2.7.patch` adds the official extension source and registers it
 on every SQLite/SQLCipher connection. Apply with pnpm's patchedDependencies and
-set `op-sqlite.sqliteFlags` to `-DOP_SQLITE_ENABLE_DECIMAL=1` in the application's
-package.json. Rebuild iOS/Android; an OTA JavaScript update cannot add native code.
+enable `sqliteDecimal` in the application's `package.json`, alongside options such
+as `sqliteVec` and `sqlcipher`:
+
+```json
+{
+  "op-sqlite": {
+    "sqliteDecimal": true
+  }
+}
+```
+
+The option is off by default and preserves any custom `sqliteFlags`. Rebuild iOS/Android; an OTA JavaScript update cannot add native code.
 The patch preserves SQLCipher's `SQLITE_EXTRA_INIT` and existing encryption setup.
 
 Source: SQLite `version-3.50.4`, `ext/misc/decimal.c` and `src/sqlite3ext.h`.

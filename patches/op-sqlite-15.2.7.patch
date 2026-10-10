@@ -10,6 +10,20 @@ index 66fd7c4dec4141a0a0c0b5c174bc5482342c0a7f..271db64101a559e5bfe316f99039ed4b
    ../cpp/utils.cpp
    ../cpp/OPThreadPool.cpp
    ../cpp/SmartHostObject.cpp
+diff --git a/android/build.gradle b/android/build.gradle
+index 08631df48e38bc75cd3aa2642f36b87dfaea4f27..cd531e415437b3b7c2436b834797e31f9f3ea275 100644
+--- a/android/build.gradle
++++ b/android/build.gradle
+@@ -72,6 +72,9 @@ if(opsqliteConfig) {
+   useSqliteVec = !!opsqliteConfig["sqliteVec"]
+   performanceMode = opsqliteConfig["performanceMode"]
+   sqliteFlags = opsqliteConfig["sqliteFlags"] ? opsqliteConfig["sqliteFlags"] : ""
++  if (opsqliteConfig["sqliteDecimal"] == true) {
++    sqliteFlags = "${sqliteFlags} -DOP_SQLITE_ENABLE_DECIMAL=1".trim()
++  }
+   enableFTS5 = !!opsqliteConfig["fts5"]
+   useLibsql = !!opsqliteConfig["libsql"]
+   enableRtree = !!opsqliteConfig["rtree"]
 diff --git a/cpp/bridge.cpp b/cpp/bridge.cpp
 index f298505fa6d3093fb91c8a5ae8d793dfc09cfa1d..d843c58a7c3627d59cb6ee5d66e52785c28837a2 100644
 --- a/cpp/bridge.cpp
@@ -1668,3 +1682,17 @@ index 0000000000000000000000000000000000000000..cf775dfbde0fdf634df5e64f9bef34e0
 +#endif
 +
 +#endif /* SQLITE3EXT_H */
+diff --git a/op-sqlite.podspec b/op-sqlite.podspec
+index a89dea89ba15cbdab67c2ead8ec75961fa28c197..4ee3fbb3a6dbb0f3c5b74a87417bd84718b01e9c 100644
+--- a/op-sqlite.podspec
++++ b/op-sqlite.podspec
+@@ -57,6 +57,9 @@ if(op_sqlite_config != nil)
+   performance_mode = op_sqlite_config["performanceMode"] || false
+   phone_version = op_sqlite_config["iosSqlite"] == true
+   sqlite_flags = op_sqlite_config["sqliteFlags"] || ""
++  if op_sqlite_config["sqliteDecimal"] == true
++    sqlite_flags = "#{sqlite_flags} -DOP_SQLITE_ENABLE_DECIMAL=1".strip
++  end
+   fts5 = op_sqlite_config["fts5"] == true
+   rtree = op_sqlite_config["rtree"] == true
+   use_sqlite_vec = op_sqlite_config["sqliteVec"] == true
