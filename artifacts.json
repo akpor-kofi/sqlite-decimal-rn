@@ -1,15 +1,19 @@
 {
-  "release": "v0.1.0",
+  "release": "v0.2.0",
   "powerSyncWeb": "1.39.1",
   "waSqlite": "1.7.2",
   "sqlite": "3.53.0",
   "emscripten": "4.0.9",
   "sourceRevision": "d33fcd38a5b5a5e5539c4a3398346d030d4d3ed0",
-  "baseUrl": "https://github.com/akpor-kofi/sqlite-decimal-rn/releases/download/v0.1.0",
+  "baseUrl": "https://github.com/akpor-kofi/sqlite-decimal-rn/releases/download/v0.2.0",
   "files": {
-    "wa-sqlite.mjs": "2c2648c499358826aa765ff75acf026739b70cf829b35d9c71a0ecc1cb84fc9b",
-    "wa-sqlite.wasm": "fa15c4b71fecee54466f71ebbaebae57412b213252d2b3756356580cb9cf2f78",
-    "wa-sqlite-async.mjs": "b9bde8e27cd00d08163a2ffdb648792de9ecfd011fe3ab5054f98c220edc8ea6",
-    "wa-sqlite-async.wasm": "b47cfdad0a302b4dbe29e3905e74d58f58fe1161e0f3e6b9e12f95dd1839ae80"
-  }
+    "wa-sqlite.mjs": "c429ad179aac8932b3a7150948e5bd561b9d1f55c3851cf1b17ed098da86dd95",
+    "wa-sqlite.wasm": "b0ac622e74d4bcae91926a7bfcc0cb6f9bdc151d920666696dcae410edefadc4",
+    "wa-sqlite-async.mjs": "889bcf76c0c76424bade30731acff7d4a466cd63abac8732b17c800695e5e1ae",
+    "wa-sqlite-async.wasm": "2f8d27ce0ee7f1b1fd50c6337fb8f0fd76f9263cac358d328a8e39a39f6c8faa"
+  },
+  "initializationFunctions": [
+    "decimal_init_static"
+  ],
+  "buildRecipeRevision": "a486e4c6a846e88770be9adfaf5f76c22880b1b6"
 }

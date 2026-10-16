@@ -91,6 +91,21 @@ Scratch tests were run outside the repositories and are not committed:
 - The pinned Linux artifact-build workflow passed.
 - Full app login/live sync and physical-device acceptance remain rollout checks.
 
+## v0.2.0 validation
+
+The Linux build workflow passed for recipe revision
+`a486e4c6a846e88770be9adfaf5f76c22880b1b6`. Browser checks against Nukodes' patched
+PowerSync Web 1.39.1 worker passed in Chromium (IndexedDB dedicated/shared workers
+and OPFS) and WebKit (IndexedDB dedicated/shared workers): exact 10,000-row sums,
+scalar/window/collation queries and persisted close/reopen. Without the exported
+initializer configured, decimal queries fail, confirming that WASM startup no
+longer auto-registers decimal. Full app login/live sync remains a rollout check.
+
+The unchanged decimal source compares `0.10` and `0.1` as unequal. This was
+reproduced with both v0.1.0 and v0.2.0 browser workers. Callers must account for
+this existing scale-comparison behavior; changing decimal semantics is outside
+this initialization change.
+
 ## Upstream Work
 
 Open upstream contributions:
