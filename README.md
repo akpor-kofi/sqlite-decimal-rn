@@ -37,8 +37,8 @@ make, a C compiler, Tcl, Node, curl, OpenSSL and jq, run:
 The recipe pins JourneyApps/PowerSync wa-sqlite 1.7.2 at
 `d33fcd38a5b5a5e5539c4a3398346d030d4d3ed0`, SQLite 3.53.0 and PowerSync core
 v0.4.13. `dist/` contains the synchronous and Asyncify JavaScript/WASM pairs and
-SHA256SUMS. The release assets were built on macOS ARM64 with that recipe/toolchain.
-CI rebuilds on Linux; byte identity across hosts is not assumed. Release consumers
+SHA256SUMS. The v0.2.0 release assets are built by the Linux workflow with that recipe/toolchain.
+Byte identity across hosts is not assumed. Release consumers
 must verify the published checksums and keep each `.mjs` with its matching `.wasm`.
 
 PowerSync's shipped browser workers already embed wa-sqlite JavaScript. Rebuild
@@ -46,7 +46,16 @@ the worker against these paired artifacts; replacing the WASM file alone can
 break the generated ABI. Keep content-versioned worker and asset URLs to prevent
 service workers mixing old workers and new modules. The Nukodes integration pins
 PowerSync Web 1.39.1, verifies downloaded artifacts and rebuilds the stock worker
-with esbuild. No adapter rewrite is required.
+with esbuild. The v0.2.0 build exports `decimal_init_static`, a no-argument function
+returning a SQLite result code. Call it after `powersync_init_static` and before
+opening a connection. It registers the extension with `sqlite3_auto_extension`.
+The build uses the unmodified wa-sqlite initialization code and adds
+`_decimal_init_static` to `powersync_exported_functions.json`.
+
+Until the SDK supports additional initialization functions, Nukodes carries a
+small `@powersync/web` patch to forward `additionalInitializationFunctions` through
+the worker options and invoke those exported names. The v0.1.0 artifacts instead
+register decimal during WASM startup and do not export this entry point.
 
 Native and web retain their SDK-supported SQLite versions (3.50.4 and 3.53.0).
 They compile the same decimal source. Downgrading the web engine solely to match
@@ -91,8 +100,10 @@ Open upstream contributions:
 - [PowerSync wa-sqlite #96](https://github.com/powersync-ja/wa-sqlite/pull/96)
 - [PowerSync docs #688](https://github.com/powersync-ja/powersync-docs/pull/688)
 
-The generic `SQLITE_WASM_EXTRA_INIT` hook makes other statically linked extensions
-possible with existing `CFILES_EXTRA` and `WASQLITE_EXTRA_DEFINES` build options.
+PowerSync review requested explicit exported initialization functions through
+`@powersync/web`. The v0.2.0 recipe follows that approach without applying the
+`SQLITE_WASM_EXTRA_INIT` hook patch. The earlier hook patch is retained for the
+existing upstream discussions.
 SQLite's own custom WASM-init documentation is the reference pattern. A forum
 proposal is included under `docs/`; SQLite uses Fossil/forum review rather than
 GitHub pull requests. No SQLite acceptance is required for this integration.

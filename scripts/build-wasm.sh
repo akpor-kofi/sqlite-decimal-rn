@@ -12,13 +12,20 @@ if [ -e "$build_dir" ]; then
 fi
 git clone https://github.com/powersync-ja/wa-sqlite.git "$build_dir"
 git -C "$build_dir" checkout d33fcd38a5b5a5e5539c4a3398346d030d4d3ed0
-git -C "$build_dir" apply "$root/patches/wa-sqlite-extra-init.patch"
 cp "$root/src/decimal.c" "$root/src/decimal-init.c" "$build_dir/src/"
 cd "$build_dir"
 node scripts/download-core-build.js
+# Use the same explicit initialization path as the PowerSync core extension.
+node --input-type=module <<'JS'
+import { readFileSync, writeFileSync } from 'node:fs';
+const file = 'powersync_exported_functions.json';
+const functions = JSON.parse(readFileSync(file, 'utf8'));
+functions.push('_decimal_init_static');
+writeFileSync(file, JSON.stringify(functions, null, 2) + '\n');
+JS
 make dist/wa-sqlite.mjs dist/wa-sqlite-async.mjs \
   CFILES_EXTRA='decimal.c decimal-init.c' \
-  WASQLITE_EXTRA_DEFINES='-DSQLITE_CORE -DSQLITE_WASM_EXTRA_INIT=sqlite3_decimal_auto_init'
+  WASQLITE_EXTRA_DEFINES='-DSQLITE_CORE'
 mkdir -p "$root/dist"
 cp dist/wa-sqlite.mjs dist/wa-sqlite.wasm dist/wa-sqlite-async.mjs dist/wa-sqlite-async.wasm "$root/dist/"
 (cd "$root/dist" && shasum -a 256 *.mjs *.wasm > SHA256SUMS)
