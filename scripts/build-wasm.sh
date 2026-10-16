@@ -18,7 +18,7 @@ node scripts/download-core-build.js
 # Use the same explicit initialization path as the PowerSync core extension.
 node --input-type=module <<'JS'
 import { readFileSync, writeFileSync } from 'node:fs';
-const file = 'powersync_exported_functions.json';
+const file = 'powersync-static/powersync_exported_functions.json';
 const functions = JSON.parse(readFileSync(file, 'utf8'));
 functions.push('_decimal_init_static');
 writeFileSync(file, JSON.stringify(functions, null, 2) + '\n');
